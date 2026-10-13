@@ -1,7 +1,7 @@
 
-import os
-import re
 import io
+import re
+import os
 from pathlib import Path
 
 import streamlit as st
@@ -9,520 +9,374 @@ from pypdf import PdfReader
 from docx import Document
 
 st.set_page_config(
-    page_title="FLM Customer Complaint Assistant",
-    page_icon="🛠️",
+    page_title="FLM Customer Support Assistant",
+    page_icon="💬",
     layout="centered"
 )
 
-st.title("🛠️ FLM Customer Complaint Assistant")
-st.write(
-    "I will ask a few questions about your complaint and "
-    "find the relevant steps from your approved FLM document."
-)
-
-# Optional: set FLM_DOC_PATH on the computer/server hosting this app.
-FLM_DOC_PATH = os.getenv("FLM_DOC_PATH", "").strip()
-
-SYSTEMS = [
-    "Provident",
-    "HLR",
-    "Siebel",
-    "CBS",
-    "Other / Not sure"
-]
-
-COMPLAINTS = [
-    "SIM Modification",
-    "Order Deletion",
-    "Provisioning",
-    "Other complaint"
-]
+st.title("💬 FLM Customer Support Assistant")
+st.caption("Your FLM procedure assistant")
+st.write("How can I help you today?")
 
 
 # --------------------------------------------------
-# READ FLM DOCUMENT
+# DOCUMENT READER
 # --------------------------------------------------
 
 def read_document(filename, file_bytes):
-    extension = Path(filename).suffix.lower()
+    ext = Path(filename).suffix.lower()
 
-    if extension == ".txt":
+    if ext == ".txt":
         return file_bytes.decode("utf-8", errors="replace")
 
-    if extension == ".pdf":
+    if ext == ".pdf":
         reader = PdfReader(io.BytesIO(file_bytes))
-        pages = []
+        return "\n".join(
+            page.extract_text() or ""
+            for page in reader.pages
+        )
 
-        for page in reader.pages:
-            pages.append(page.extract_text() or "")
-
-        return "\n".join(pages)
-
-    if extension == ".docx":
+    if ext == ".docx":
         doc = Document(io.BytesIO(file_bytes))
-        parts = []
-
-        for paragraph in doc.paragraphs:
-            if paragraph.text.strip():
-                parts.append(paragraph.text)
+        lines = [
+            p.text.strip()
+            for p in doc.paragraphs
+            if p.text.strip()
+        ]
 
         for table in doc.tables:
             for row in table.rows:
-                parts.append(
-                    " | ".join(cell.text.strip() for cell in row.cells)
+                lines.append(
+                    " | ".join(
+                        cell.text.strip()
+                        for cell in row.cells
+                    )
                 )
 
-        return "\n".join(parts)
+        return "\n".join(lines)
 
-    raise ValueError("Please use a PDF, DOCX, or TXT document.")
+    raise ValueError("Supported formats: PDF, DOCX, TXT")
 
 
-def split_document(text, max_chars=900):
+def split_sections(text):
+    # Keep paragraphs and numbered steps together where possible.
     paragraphs = [
-        p.strip()
-        for p in re.split(r"\n+", text)
-        if p.strip()
+        x.strip()
+        for x in re.split(r"\n+", text)
+        if x.strip()
     ]
 
-    chunks = []
+    sections = []
     current = ""
 
     for paragraph in paragraphs:
-
-        if len(paragraph) > max_chars:
+        if len(paragraph) > 1200:
             if current:
-                chunks.append(current)
+                sections.append(current)
                 current = ""
 
-            for start in range(0, len(paragraph), max_chars):
-                chunks.append(paragraph[start:start + max_chars])
+            sections.extend(
+                paragraph[i:i + 1000]
+                for i in range(0, len(paragraph), 1000)
+            )
 
-        elif not current:
-            current = paragraph
-
-        elif len(current) + len(paragraph) + 1 <= max_chars:
-            current += "\n" + paragraph
+        elif len(current) + len(paragraph) < 1200:
+            current = (
+                current + "\n" + paragraph
+                if current else paragraph
+            )
 
         else:
-            chunks.append(current)
+            sections.append(current)
             current = paragraph
 
     if current:
-        chunks.append(current)
+        sections.append(current)
 
-    return chunks
+    return sections
 
 
 # --------------------------------------------------
-# SEARCH ONLY THE APPROVED FLM DOCUMENT
+# DOCUMENT SEARCH
 # --------------------------------------------------
 
-STOP_WORDS = {
-    "the", "and", "for", "with", "from", "what", "when",
-    "where", "which", "how", "does", "this", "that",
-    "are", "is", "to", "of", "in", "on", "a", "an",
-    "i", "we", "you", "my", "please", "steps", "issue",
-    "facing", "help", "complaint", "system", "node",
-    "tell", "me", "can", "could", "would", "should",
-    "about", "explain", "meaning", "brief", "briefly"
-}
+def normalise(text):
+    return re.sub(
+        r"[^a-z0-9\s]",
+        " ",
+        text.lower()
+    ).strip()
 
 
-def get_terms(text):
-    words = re.findall(r"[a-zA-Z0-9_-]+", text.lower())
+def find_matching_sections(question, sections, limit=4):
+    q = normalise(question)
 
-    return {
-        word for word in words
-        if len(word) > 1 and word not in STOP_WORDS
+    # Expand common support terms for retrieval only.
+    replacements = {
+        "sim mod": "sim modification",
+        "sim modification": "sim modification",
+        "apps": "applications",
+        "application": "applications",
+        "fix steps": "fixture steps",
+        "fixation steps": "fixture steps",
     }
 
+    for old, new in replacements.items():
+        q = q.replace(old, new)
 
-def find_sections(question, complaint, system, chunks, limit=3):
+    stop_words = {
+        "the", "is", "are", "of", "for", "to", "in",
+        "a", "an", "and", "please", "tell", "me",
+        "give", "show", "what", "how", "can", "you",
+        "about", "i", "want", "know", "only", "explain"
+    }
 
-    terms = get_terms(
-        f"{question} {complaint} {system}"
-    )
+    terms = {
+        word for word in q.split()
+        if len(word) > 1 and word not in stop_words
+    }
 
     if not terms:
         return []
 
-    results = []
+    scored = []
 
-    for index, chunk in enumerate(chunks):
-        lower_chunk = chunk.lower()
+    for index, section in enumerate(sections):
+        content = normalise(section)
 
         score = sum(
-            lower_chunk.count(term)
+            content.count(term)
             for term in terms
         )
 
-        if complaint.lower() in lower_chunk:
-            score += 4
+        # Prefer sections that contain the full complaint name.
+        if "sim modification" in q and "sim modification" in content:
+            score += 5
 
-        if system and system.lower() in lower_chunk:
-            score += 3
+        if score:
+            scored.append((score, index, section))
 
-        if score > 0:
-            results.append((score, index, chunk))
-
-    results.sort(
-        key=lambda item: (-item[0], item[1])
-    )
+    scored.sort(key=lambda x: (-x[0], x[1]))
 
     return [
         item[2]
-        for item in results[:limit]
+        for item in scored[:limit]
     ]
 
 
-def load_shared_document(path_text):
-    path = Path(path_text).expanduser()
+def classify_question(question):
+    q = normalise(question)
 
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Document not found: {path}"
+    if any(x in q for x in [
+        "application", "applications", "apps",
+        "system involved", "systems involved", "node involved"
+    ]):
+        return "applications"
+
+    if any(x in q for x in [
+        "fixture", "fixature", "fixation",
+        "fix steps", "troubleshoot", "troubleshooting"
+    ]):
+        return "fixture"
+
+    if any(x in q for x in [
+        "procedure", "process", "steps",
+        "how to", "how do i", "workflow"
+    ]):
+        return "procedure"
+
+    if any(x in q for x in [
+        "meaning", "define", "definition",
+        "what is", "explain", "overview"
+    ]):
+        return "meaning"
+
+    # A complaint name by itself requests a brief overview.
+    return "overview"
+
+
+def select_query(question, intent, complaint):
+    if intent == "applications":
+        return f"{complaint} applications involved systems applications nodes"
+
+    if intent == "procedure":
+        return f"{complaint} procedure process steps workflow"
+
+    if intent == "fixture":
+        return f"{complaint} fixture fixature fixation troubleshooting steps"
+
+    if intent == "meaning":
+        return f"{complaint} meaning definition overview description"
+
+    if intent == "overview":
+        return f"{complaint} meaning definition overview description"
+
+    return f"{complaint} {question}"
+
+
+def format_answer(question, sections, complaint):
+    intent = classify_question(question)
+
+    search_query = select_query(
+        question,
+        intent,
+        complaint
+    )
+
+    matches = find_matching_sections(
+        search_query,
+        sections,
+        limit=4
+    )
+
+    if not matches:
+        return (
+            "I could not find this information in the provided "
+            "FLM document. Please try another keyword or check "
+            "with your FLM document owner."
         )
 
-    return path.name, path.read_bytes()
+    # For the complaint name or meaning, keep the response brief.
+    if intent in ("overview", "meaning"):
+        text = "\n".join(matches[:2])
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+
+        # Three lines maximum, without creating new facts.
+        return "\n".join(lines[:3])
+
+    # For applications, procedure and fixture steps, show only
+    # the sections relevant to the requested subject.
+    return "\n\n".join(matches)
 
 
 # --------------------------------------------------
-# SESSION STATE
-# Used for temporary question flow, not a database.
-# --------------------------------------------------
-
-if "step" not in st.session_state:
-    st.session_state.step = 1
-
-if "complaint" not in st.session_state:
-    st.session_state.complaint = ""
-
-if "issue" not in st.session_state:
-    st.session_state.issue = ""
-
-if "system" not in st.session_state:
-    st.session_state.system = ""
-
-
-def restart_chat():
-    for key in [
-        "step",
-        "complaint",
-        "issue",
-        "system",
-        "other_system",
-        "other_complaint",
-        "issue_input",
-        "complaint_select",
-        "system_select"
-    ]:
-        if key in st.session_state:
-            del st.session_state[key]
-
-    st.session_state.step = 1
-
-
-# --------------------------------------------------
-# DOCUMENT SELECTION
+# LOAD THE FLM DOCUMENT
 # --------------------------------------------------
 
 with st.sidebar:
-    st.subheader("Approved FLM Document")
+    st.subheader("FLM Document")
 
     uploaded_file = st.file_uploader(
-        "Upload your FLM procedure",
+        "Upload approved FLM document",
         type=["pdf", "docx", "txt"]
     )
 
     st.caption(
-        "Alternatively, configure FLM_DOC_PATH on "
-        "the computer running Streamlit."
+        "Only this document is used as the knowledge source."
     )
 
-    if st.button("Start New Complaint"):
-        restart_chat()
-        st.rerun()
-
-
-document_name = None
 document_bytes = None
+document_name = None
 
 if uploaded_file is not None:
-    document_name = uploaded_file.name
     document_bytes = uploaded_file.getvalue()
+    document_name = uploaded_file.name
 
-elif FLM_DOC_PATH:
+elif os.getenv("FLM_DOC_PATH"):
+    path = Path(os.getenv("FLM_DOC_PATH"))
+
+    if path.is_file():
+        document_bytes = path.read_bytes()
+        document_name = path.name
+
+sections = []
+
+if document_bytes:
     try:
-        document_name, document_bytes = load_shared_document(
-            FLM_DOC_PATH
-        )
-    except Exception as error:
-        st.error(f"Could not load FLM document: {error}")
-
-
-chunks = []
-
-if document_bytes is not None:
-    try:
-        document_text = read_document(
+        text = read_document(
             document_name,
             document_bytes
         )
+        sections = split_sections(text)
 
-        chunks = split_document(document_text)
-
-        if not document_text.strip():
+        if not sections:
             st.warning(
-                "No readable text found. Scanned PDFs may require OCR."
-            )
-        else:
-            st.sidebar.success(
-                f"Document loaded: {document_name}"
+                "No readable text was found in the document."
             )
 
     except Exception as error:
-        st.error(f"Document reading error: {error}")
+        st.error(f"Could not read the FLM document: {error}")
 
 
 # --------------------------------------------------
-# GUIDED QUESTION FLOW
+# CHAT INTERFACE
 # --------------------------------------------------
 
-if not chunks:
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
+if "complaint_name" not in st.session_state:
+    st.session_state.complaint_name = "SIM Modification"
+
+if not sections:
     st.info(
-        "Please upload your approved FLM document "
-        "using the sidebar before starting."
+        "Please upload your approved FLM document in the sidebar "
+        "to start chatting."
     )
 
-else:
+# Show current in-memory conversation.
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-    # QUESTION 1: COMPLAINT TYPE
+question = st.chat_input(
+    "Ask about SIM Modification, applications, procedure..."
+)
 
-    st.subheader("Step 1: Complaint Type")
+if question:
 
-    selected_complaint = st.selectbox(
-        "Which complaint are you facing?",
-        COMPLAINTS,
-        key="complaint_select"
-    )
+    if not sections:
+        st.warning("Upload an FLM document before asking questions.")
 
-    if selected_complaint == "Other complaint":
-        other_complaint = st.text_input(
-            "Enter the complaint name",
-            key="other_complaint"
-        )
     else:
-        other_complaint = ""
+        # Remember the complaint topic temporarily.
+        q = normalise(question)
 
-    if st.button("Continue to Explanation"):
+        if "sim modification" in q or "sim mod" in q:
+            st.session_state.complaint_name = "SIM Modification"
 
-        if (
-            selected_complaint == "Other complaint"
-            and not other_complaint.strip()
-        ):
-            st.warning("Please enter the complaint name.")
+        elif "order deletion" in q:
+            st.session_state.complaint_name = "Order Deletion"
 
-        else:
-            if selected_complaint == "Other complaint":
-                st.session_state.complaint = (
-                    other_complaint.strip()
-                )
-            else:
-                st.session_state.complaint = (
-                    selected_complaint
-                )
+        elif "provisioning" in q:
+            st.session_state.complaint_name = "Provisioning"
 
-            st.session_state.step = 2
-            st.rerun()
+        st.session_state.messages.append({
+            "role": "user",
+            "content": question
+        })
 
+        with st.chat_message("user"):
+            st.markdown(question)
 
-    # QUESTION 2: BRIEF MEANING
-
-    if st.session_state.step >= 2:
-
-        st.divider()
-        st.subheader("Step 2: Brief Explanation")
-
-        st.write(
-            f"**Selected complaint:** "
-            f"{st.session_state.complaint}"
+        answer = format_answer(
+            question,
+            sections,
+            st.session_state.complaint_name
         )
 
-        definition_sections = find_sections(
-            question="definition meaning overview purpose description",
-            complaint=st.session_state.complaint,
-            system="",
-            chunks=chunks,
-            limit=1
-        )
+        with st.chat_message("assistant"):
+            st.markdown(answer)
 
-        if definition_sections:
-            st.write(
-                "The following is the closest matching text "
-                "from your approved FLM document:"
-            )
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer
+        })
 
-            st.info(definition_sections[0])
+st.sidebar.divider()
 
-        else:
-            st.info(
-                "A brief definition was not identified in "
-                "the FLM document. Please refer to your "
-                "approved team definition."
-            )
-
-        st.caption(
-            "The chatbot will not invent a definition "
-            "that is absent from the document."
-        )
-
-
-    # QUESTION 3: EXACT ISSUE
-
-    if st.session_state.step >= 2:
-
-        st.divider()
-        st.subheader("Step 3: Describe Your Issue")
-
-        st.write(
-            "How can I help you? Where are you facing the issue?"
-        )
-
-        issue_text = st.text_area(
-            "Describe the problem or error message",
-            placeholder=(
-                "Example: SIM modification request fails "
-                "after submission in Siebel. What error "
-                "message appears?"
-            ),
-            key="issue_input"
-        )
-
-        if st.button("Continue to System Selection"):
-
-            if not issue_text.strip():
-                st.warning(
-                    "Please describe the issue before continuing."
-                )
-
-            else:
-                st.session_state.issue = issue_text.strip()
-                st.session_state.step = 3
-                st.rerun()
-
-
-    # QUESTION 4: SYSTEM / NODE
-
-    if st.session_state.step >= 3:
-
-        st.divider()
-        st.subheader("Step 4: Select the Affected Node")
-
-        selected_system = st.selectbox(
-            "On which node or system are you facing the issue?",
-            SYSTEMS,
-            key="system_select"
-        )
-
-        if selected_system == "Other / Not sure":
-            other_system = st.text_input(
-                "Enter the node name if known",
-                key="other_system"
-            )
-        else:
-            other_system = ""
-
-        if st.button(
-            "Find Relevant FLM Steps",
-            type="primary"
-        ):
-
-            if (
-                selected_system == "Other / Not sure"
-                and other_system.strip()
-            ):
-                st.session_state.system = other_system.strip()
-            else:
-                st.session_state.system = selected_system
-
-            st.session_state.step = 4
-            st.rerun()
-
-
-    # QUESTION 5: DISPLAY RELEVANT DOCUMENT TEXT
-
-    if st.session_state.step >= 4:
-
-        st.divider()
-        st.subheader("Step 5: Troubleshooting Result")
-
-        st.write(
-            f"**Complaint:** {st.session_state.complaint}"
-        )
-
-        st.write(
-            f"**Reported issue:** {st.session_state.issue}"
-        )
-
-        st.write(
-            f"**Node/system:** {st.session_state.system}"
-        )
-
-        relevant = find_sections(
-            question=st.session_state.issue,
-            complaint=st.session_state.complaint,
-            system=st.session_state.system,
-            chunks=chunks,
-            limit=3
-        )
-
-        if relevant:
-
-            st.write(
-                "Relevant sections found in your FLM document:"
-            )
-
-            for number, section in enumerate(
-                relevant, start=1
-            ):
-                with st.expander(
-                    f"Relevant section {number}",
-                    expanded=(number == 1)
-                ):
-                    st.text(section)
-
-            st.warning(
-                "These are matching document excerpts, not "
-                "independently verified instructions. Follow "
-                "your approved operational procedure."
-            )
-
-        else:
-
-            st.warning(
-                "No relevant section was found for this issue "
-                "and node in the provided FLM document. "
-                "Try different keywords or contact your FLM "
-                "document owner. No external steps have been added."
-            )
-
-        if st.button("Start Another Complaint"):
-            restart_chat()
-            st.rerun()
-
-
-# --------------------------------------------------
-# PRIVACY NOTICE
-# --------------------------------------------------
-
-st.divider()
+if st.sidebar.button("Clear conversation"):
+    st.session_state.messages = []
+    st.session_state.complaint_name = "SIM Modification"
+    st.rerun()
 
 st.caption(
-    "Privacy: this code does not deliberately save chat "
-    "transcripts to files or a database and does not call "
-    "an external AI API. Data is processed temporarily by "
-    "the running application. Hosting logs, access controls, "
-    "shared-folder permissions, and platform-level handling "
-    "must be managed separately."
+    "Privacy: the app does not deliberately write conversation "
+    "history to a file or database. Messages are kept in Streamlit "
+    "session state while the session is active. Hosting logs and "
+    "platform-level data handling are separate."
 )
